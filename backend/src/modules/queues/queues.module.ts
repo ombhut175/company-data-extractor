@@ -38,7 +38,7 @@ export class QueuesModule implements OnModuleDestroy {
   constructor(
     @InjectQueue("email") private readonly emailQueue: Queue,
     @InjectQueue("workflow") private readonly workflowQueue: Queue,
-  ) { }
+  ) {}
 
   async onModuleDestroy() {
     await this.emailQueue.close();

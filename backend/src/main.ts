@@ -140,8 +140,10 @@ async function bootstrap() {
 
     await app.listen(port, "0.0.0.0");
 
+    // eslint-disable-next-line no-console
     console.log(`🚀 Application is running on: http://localhost:${port}`);
     if (!isProd && swaggerEnabled) {
+      // eslint-disable-next-line no-console
       console.log(
         `📚 Swagger documentation available at: http://localhost:${port}/api/docs`,
       );

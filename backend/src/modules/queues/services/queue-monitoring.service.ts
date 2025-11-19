@@ -111,8 +111,7 @@ export class QueueMonitoringService {
     const failedJobs = await queue.getFailed(0, 100);
     const waitingJobs = await queue.getWaiting(0, 1);
 
-    const avgProcessingTime =
-      await this.calculateAvgProcessingTime(completedJobs);
+    const avgProcessingTime = this.calculateAvgProcessingTime(completedJobs);
 
     const totalProcessed = completedJobs.length;
     const totalFailed = failedJobs.length;
