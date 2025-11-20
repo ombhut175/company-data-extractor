@@ -11,7 +11,7 @@ export const scrapingItems = pgTable("scraping_items", {
   id: uuid("id").primaryKey().defaultRandom(),
   jobId: uuid("job_id")
     .notNull()
-    .references(() => scrapingJobs.id),
+    .references(() => scrapingJobs.id, { onDelete: "cascade" }),
 
   url: text("url").notNull(),
 

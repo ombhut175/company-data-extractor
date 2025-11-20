@@ -12,6 +12,7 @@ import { TestModule } from "./modules/test/test.module";
 import { AuthModule } from "./modules/auth/auth.module";
 import { HealthCheckModule } from "./modules/health-check/health-check.module";
 import { QueuesModule } from "./modules/queues/queues.module";
+import { ScrapingModule } from "./modules/scraping/scraping.module";
 import { envValidationSchema } from "./config/env.validation";
 
 const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
@@ -45,6 +46,7 @@ const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
     AuthModule,
     HealthCheckModule,
     QueuesModule,
+    ScrapingModule,
   ],
   controllers: [AppController],
   providers: [AppService],

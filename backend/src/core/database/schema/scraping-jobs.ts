@@ -3,7 +3,7 @@ import { users } from "./users";
 
 export const scrapingJobs = pgTable("scraping_jobs", {
   id: uuid("id").primaryKey().defaultRandom(),
-  userId: uuid("user_id").references(() => users.id),
+  userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
   status: text("status").notNull().default("pending"),
   // pending | processing | completed | failed
   totalUrls: integer("total_urls").notNull().default(0),
