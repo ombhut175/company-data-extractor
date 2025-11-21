@@ -4,6 +4,8 @@ import { ConfigService } from "@nestjs/config";
 import { Job } from "bullmq";
 import axios, { AxiosError } from "axios";
 import * as cheerio from "cheerio";
+import nlp from "compromise";
+import * as crypto from "crypto";
 import { Agent as HttpAgent } from "http";
 import { Agent as HttpsAgent } from "https";
 import { ScrapingRepository } from "../../../core/database/repositories/scraping.repository";
@@ -23,7 +25,7 @@ interface CompanyData {
 }
 
 /**
- * CSS selectors for HTML parsing
+ * CSS selectors for HTML parsing with fallback patterns
  */
 const SELECTORS = {
   COMPANY_NAME: "h1.company-name",
@@ -38,6 +40,46 @@ const SELECTORS = {
 };
 
 /**
+ * Fallback selectors for unstructured data extraction
+ */
+const FALLBACK_SELECTORS = {
+  COMPANY_NAME: [
+    "h1",
+    "title",
+    'meta[property="og:site_name"]',
+    'meta[name="application-name"]',
+    ".company-title",
+    ".business-name",
+    '[itemtype*="Organization"] [itemprop="name"]',
+  ],
+  WEBSITE: [
+    'a[href*="http"]',
+    'link[rel="canonical"]',
+    'meta[property="og:url"]',
+  ],
+  INDUSTRY: [
+    ".category",
+    ".sector",
+    '[itemprop="industry"]',
+    'meta[name="keywords"]',
+  ],
+  HEADCOUNT: [
+    ".employees",
+    ".team-size",
+    ".staff-count",
+    '[itemprop="numberOfEmployees"]',
+  ],
+  LOCATION: [
+    ".address",
+    ".location",
+    ".city",
+    '[itemprop="address"]',
+    '[itemprop="location"]',
+    'meta[name="geo.position"]',
+  ],
+};
+
+/**
  * Background processor for scraping jobs
  * Processes URLs from the queue, fetches HTML, extracts data, and updates database
  */
@@ -46,6 +88,12 @@ export class ScrapingProcessor extends WorkerHost {
   private readonly logger = new Logger(ScrapingProcessor.name);
   private readonly httpAgent: HttpAgent;
   private readonly httpsAgent: HttpsAgent;
+
+  // Cache NER results per request to avoid duplicate processing
+  private nerCache = new Map<
+    string,
+    Partial<CompanyData> & { people: string[]; emails: string[] }
+  >();
 
   constructor(
     private readonly scrapingRepository: ScrapingRepository,
@@ -198,9 +246,13 @@ export class ScrapingProcessor extends WorkerHost {
         timestamp: new Date().toISOString(),
       });
 
-      // Parse company data and contacts
-      const companyData = this.parseCompanyData(html);
-      const contacts = this.parseContacts(html);
+      // Parse company data and contacts with shared cheerio instance
+      const $ = cheerio.load(html) as unknown as cheerio.CheerioAPI;
+      const companyData = this.parseCompanyData($, itemId);
+      const contacts = this.parseContacts($, itemId);
+
+      // Clear NER cache for this item after processing
+      this.nerCache.delete(itemId);
 
       this.logger.log("Data parsed successfully", {
         operation: "processItem",
@@ -382,28 +434,187 @@ export class ScrapingProcessor extends WorkerHost {
   }
 
   /**
+   * Try fallback selectors to extract value
+   * Fixed logic to properly handle different selector types
+   */
+  private tryFallbackSelectors(
+    $: cheerio.CheerioAPI,
+    selectors: string[],
+  ): string | null {
+    for (const selector of selectors) {
+      let value: string | undefined;
+
+      try {
+        if (selector.startsWith("meta")) {
+          // Meta tags use content attribute
+          value = $(selector).attr("content");
+        } else if (selector === "title") {
+          // Title tag text
+          value = $("title").text();
+        } else if (selector.startsWith("link")) {
+          // Link tags use href attribute
+          value = $(selector).attr("href");
+        } else if (selector.includes("[href")) {
+          // Anchor tags with href in selector
+          value = $(selector).first().attr("href");
+        } else {
+          // Regular selectors use text content
+          value = $(selector).first().text();
+        }
+
+        if (value) {
+          const cleaned = value.trim();
+          if (cleaned.length > 0 && cleaned.length < 500) {
+            // Avoid extremely long extractions
+            return cleaned;
+          }
+        }
+      } catch {
+        // Skip invalid selectors
+        continue;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract company information using NLP from page text
+   * Includes text size limit and null checks for performance
+   * Uses caching to avoid duplicate processing for same item
+   */
+  private extractWithNER(
+    $: cheerio.CheerioAPI,
+    cacheKey: string,
+  ): Partial<CompanyData> & { people: string[]; emails: string[] } {
+    // Check cache first
+    const cached = this.nerCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const MAX_TEXT_LENGTH = 100000; // 100KB limit for NLP processing
+    let bodyText = $("body").text().replace(/\s+/g, " ").trim();
+
+    // Return empty if no text found or text is too short
+    if (!bodyText || bodyText.length < 50) {
+      const emptyResult = {
+        companyName: null,
+        hqLocation: null,
+        people: [],
+        emails: [],
+      };
+      this.nerCache.set(cacheKey, emptyResult);
+      return emptyResult;
+    }
+
+    // Limit text size for performance
+    if (bodyText.length > MAX_TEXT_LENGTH) {
+      bodyText = bodyText.substring(0, MAX_TEXT_LENGTH);
+    }
+
+    const doc = nlp(bodyText);
+
+    const organizations = doc.organizations().out("array") as string[];
+    const places = doc.places().out("array") as string[];
+    const people = doc.people().out("array") as string[];
+
+    // Extract emails using improved regex
+    const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+    const emails = bodyText.match(emailRegex) || [];
+
+    // Filter noisy NER outputs
+    const companyName =
+      organizations.find((o) => o.length > 1 && o.length < 100) || null;
+    const hqLocation =
+      places.find((p) => p.length > 1 && p.length < 100) || null;
+
+    const result = {
+      companyName,
+      hqLocation,
+      people,
+      emails,
+    };
+
+    // Cache result
+    this.nerCache.set(cacheKey, result);
+    return result;
+  }
+
+  /**
    * Parse company data from HTML using Cheerio
    * Extracts company name, website, industry, headcount, and location
+   * Now accepts CheerioAPI instance for better performance
    */
-  private parseCompanyData(html: string): CompanyData {
+  private parseCompanyData($: cheerio.CheerioAPI, itemId: string): CompanyData {
     const requestId = crypto.randomUUID();
 
     this.logger.log("Parsing company data", {
       operation: "parseCompanyData",
       requestId,
-      htmlLength: html.length,
       timestamp: new Date().toISOString(),
     });
 
     try {
-      const $ = cheerio.load(html);
+      // Layer 1: Try structured selectors
+      let companyName = $(SELECTORS.COMPANY_NAME).text().trim() || null;
+      let website = $(SELECTORS.COMPANY_WEBSITE).attr("href") || null;
+      let industry = $(SELECTORS.INDUSTRY).text().trim() || null;
+      let headcountRange = $(SELECTORS.HEADCOUNT).text().trim() || null;
+      let hqLocation = $(SELECTORS.LOCATION).text().trim() || null;
+
+      // Layer 2: Try fallback selectors for missing data
+      if (!companyName) {
+        companyName = this.tryFallbackSelectors(
+          $,
+          FALLBACK_SELECTORS.COMPANY_NAME,
+        );
+      }
+      if (!website) {
+        website = this.tryFallbackSelectors($, FALLBACK_SELECTORS.WEBSITE);
+      }
+      if (!industry) {
+        industry = this.tryFallbackSelectors($, FALLBACK_SELECTORS.INDUSTRY);
+      }
+      if (!headcountRange) {
+        headcountRange = this.tryFallbackSelectors(
+          $,
+          FALLBACK_SELECTORS.HEADCOUNT,
+        );
+      }
+      if (!hqLocation) {
+        hqLocation = this.tryFallbackSelectors($, FALLBACK_SELECTORS.LOCATION);
+      }
+
+      // Layer 3: Try NER extraction for company name and location if still missing
+      if (!companyName || !hqLocation) {
+        const nerData = this.extractWithNER($, itemId);
+        if (!companyName && nerData.companyName) {
+          companyName = nerData.companyName;
+          this.logger.log("Company name extracted using NER", {
+            operation: "parseCompanyData",
+            requestId,
+            companyName,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        if (!hqLocation && nerData.hqLocation) {
+          hqLocation = nerData.hqLocation;
+          this.logger.log("Location extracted using NER", {
+            operation: "parseCompanyData",
+            requestId,
+            hqLocation,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
 
       const companyData: CompanyData = {
-        companyName: $(SELECTORS.COMPANY_NAME).text().trim() || null,
-        website: $(SELECTORS.COMPANY_WEBSITE).attr("href") || null,
-        industry: $(SELECTORS.INDUSTRY).text().trim() || null,
-        headcountRange: $(SELECTORS.HEADCOUNT).text().trim() || null,
-        hqLocation: $(SELECTORS.LOCATION).text().trim() || null,
+        companyName,
+        website,
+        industry,
+        headcountRange,
+        hqLocation,
       };
 
       this.logger.log("Company data parsed successfully", {
@@ -412,6 +623,7 @@ export class ScrapingProcessor extends WorkerHost {
         companyName: companyData.companyName,
         hasWebsite: !!companyData.website,
         hasIndustry: !!companyData.industry,
+        extractionMethod: this.getExtractionMethod(companyData),
         timestamp: new Date().toISOString(),
       });
 
@@ -441,23 +653,39 @@ export class ScrapingProcessor extends WorkerHost {
   }
 
   /**
+   * Determine extraction method used (for logging)
+   */
+  private getExtractionMethod(data: CompanyData): string {
+    const methods: string[] = [];
+    if (data.companyName) methods.push("name");
+    if (data.website) methods.push("website");
+    if (data.industry) methods.push("industry");
+    if (data.headcountRange) methods.push("headcount");
+    if (data.hqLocation) methods.push("location");
+    return methods.length > 0 ? methods.join("+") : "none";
+  }
+
+  /**
    * Parse contact information from HTML using Cheerio
    * Extracts contact cards with name, title, and email
+   * Now accepts CheerioAPI instance for better performance
    */
-  private parseContacts(html: string): Contact[] | null {
+  private parseContacts(
+    $: cheerio.CheerioAPI,
+    itemId: string,
+  ): Contact[] | null {
     const requestId = crypto.randomUUID();
 
     this.logger.log("Parsing contacts", {
       operation: "parseContacts",
       requestId,
-      htmlLength: html.length,
       timestamp: new Date().toISOString(),
     });
 
     try {
-      const $ = cheerio.load(html);
       const contacts: Contact[] = [];
 
+      // Layer 1: Try structured contact cards
       $(SELECTORS.CONTACT_CARD).each((_, element) => {
         const name = $(element).find(SELECTORS.CONTACT_NAME).text().trim();
         const title = $(element).find(SELECTORS.CONTACT_TITLE).text().trim();
@@ -469,10 +697,51 @@ export class ScrapingProcessor extends WorkerHost {
         }
       });
 
+      // Layer 2: If no structured contacts found, try extracting people names using NER
+      if (contacts.length === 0) {
+        const nerData = this.extractWithNER($, itemId);
+
+        if (nerData.people.length > 0 && nerData.emails.length > 0) {
+          // Improved matching: create unique email set and match with people
+          const uniqueEmails = [...new Set(nerData.emails)];
+          const maxMatches = Math.min(
+            nerData.people.length,
+            uniqueEmails.length,
+          );
+
+          // Match first N people with first N unique emails
+          for (let i = 0; i < maxMatches; i++) {
+            const person = nerData.people[i];
+            const email = uniqueEmails[i];
+
+            // Basic validation: person name should be reasonable length
+            if (person && person.length > 1 && person.length < 100) {
+              contacts.push({
+                name: person,
+                title: "Unknown",
+                email: email,
+              });
+            }
+          }
+
+          if (contacts.length > 0) {
+            this.logger.log("Contacts extracted using NER", {
+              operation: "parseContacts",
+              requestId,
+              contactCount: contacts.length,
+              peopleFound: nerData.people.length,
+              emailsFound: nerData.emails.length,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
       this.logger.log("Contacts parsed successfully", {
         operation: "parseContacts",
         requestId,
         contactCount: contacts.length,
+        extractionMethod: contacts.length > 0 ? "structured or NER" : "none",
         timestamp: new Date().toISOString(),
       });
 

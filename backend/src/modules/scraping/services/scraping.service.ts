@@ -36,16 +36,19 @@ export class ScrapingService {
   async createJob(
     userId: string,
     file?: Express.Multer.File,
-    useMockServer?: boolean,
+    useMockServer?: boolean | string,
   ): Promise<{ jobId: string }> {
     const requestId = crypto.randomUUID();
+
+    // Ensure useMockServer is a boolean (handles "true"/"false" strings from multipart/form-data)
+    const isMockServer = String(useMockServer) === "true";
 
     this.logger.log("Creating scraping job", {
       operation: "createJob",
       requestId,
       userId,
       hasFile: !!file,
-      useMockServer: !!useMockServer,
+      useMockServer: isMockServer,
       fileName: file?.originalname,
       fileSize: file?.size,
       timestamp: new Date().toISOString(),
@@ -53,7 +56,7 @@ export class ScrapingService {
 
     try {
       // Validate input: file XOR useMockServer
-      if (!file && !useMockServer) {
+      if (!file && !isMockServer) {
         this.logger.warn("Job creation failed: no input provided", {
           operation: "createJob",
           requestId,
@@ -65,7 +68,7 @@ export class ScrapingService {
         );
       }
 
-      if (file && useMockServer) {
+      if (file && isMockServer) {
         this.logger.warn("Job creation failed: both inputs provided", {
           operation: "createJob",
           requestId,
@@ -419,6 +422,7 @@ export class ScrapingService {
           protocols: ["http", "https"],
           require_protocol: true,
           require_valid_protocol: true,
+          require_tld: false,
         });
 
         if (!isValid) {

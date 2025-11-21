@@ -50,7 +50,7 @@ import {
 export class ScrapingController {
   private readonly logger = new Logger(ScrapingController.name);
 
-  constructor(private readonly scrapingService: ScrapingService) { }
+  constructor(private readonly scrapingService: ScrapingService) {}
 
   /**
    * Create a new scraping job

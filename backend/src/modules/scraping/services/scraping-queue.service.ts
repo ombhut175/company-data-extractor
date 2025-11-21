@@ -118,7 +118,7 @@ export class ScrapingQueueService {
    * @returns Array of BullMQ job IDs
    */
   async enqueueMultipleUrlJobs(
-    items: Array<{ itemId: string; url: string; jobId: string }>,
+    items: { itemId: string; url: string; jobId: string }[],
   ): Promise<string[]> {
     this.logger.log(`Enqueuing multiple URL jobs`, {
       operation: "enqueueMultipleUrlJobs",
