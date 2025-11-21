@@ -32,7 +32,7 @@ export class ScrapingQueueService {
 
   constructor(
     @InjectQueue("scrape-queue") private readonly scrapeQueue: Queue,
-  ) {}
+  ) { }
 
   /**
    * Enqueue a single URL scraping job
